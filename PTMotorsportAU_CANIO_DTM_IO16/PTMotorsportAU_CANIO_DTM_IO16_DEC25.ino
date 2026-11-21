@@ -88,25 +88,49 @@ bool DPI2in = 0; // storage for digital input value as bool
 bool DPI3in = 0; // storage for digital input value as bool
 bool DPI4in = 0; // storage for digital input value as bool
 
-// AVI Thresholds (not implemented as functional logic, but defined for configuration)
-unsigned int AVI1_ON_TH = 0;
-unsigned int AVI1_OFF_TH = 0;
+// SPI(DPI) Configuration (NOT currently stored/read from EEPROM)
+// Bit 7-6: Pin Mode (0=Reluctor, 1=Hall Effect, 2=Custom). Default Hall Effect (1) --Incorrect?
+// byte SPI_MODE_DPI1 = 1;
+// SPI Config storage
+struct SPIConfigStruct
+{
+	byte pinMode;
+	bool edgeSelect;
+	bool pullUp;
+	bool lastState;
+};
+// Default values
+SPIConfigStruct SpiConfigs[4] = {
+	{1, 0, 0, 0},
+	{1, 0, 0, 0},
+	{1, 0, 0, 0},
+	{1, 0, 0, 0}};
 
-// DPI/SPI Configuration (stored/read from EEPROM)
-// Bit 7-6: Pin Mode (0=Reluctor, 1=Hall Effect, 2=Custom). Default Hall Effect (1)
-byte SPI_MODE_DPI1 = 1;
+// AVI Threshold Storage
+struct AVIConfigStruct
+{
+	unsigned int ON_TH;
+	unsigned int OFF_TH;
+};
+// Default values to something impossible so we know if they get set
+AVIConfigStruct AviConfigs[4] = {
+	{65535, 65535},
+	{65535, 65535},
+	{65535, 65535},
+	{65535, 65535}};
+// AVI value storage -- UNUSED
+int scaledvalue1 = 0; // storage for 12 bit analog value
+int scaledvalue2 = 0; // storage for 12 bit analog value
+int scaledvalue3 = 0; // storage for 12 bit analog value
+int scaledvalue4 = 0; // storage for 12 bit analog value
 
+// DPI 1 Freq Calculation storage
 volatile unsigned long lastTime = 0; // DI1 time storage (Freq read)
 volatile unsigned long highTime = 0;
 volatile unsigned long lowTime = 0;
 volatile bool lastState = LOW;
 volatile unsigned long lastInterruptTime = 0;
 const unsigned long timeoutInterval = 2000000; // 2 seconds in microseconds
-
-int scaledvalue1 = 0; // storage for 12 bit analog value
-int scaledvalue2 = 0; // storage for 12 bit analog value
-int scaledvalue3 = 0; // storage for 12 bit analog value
-int scaledvalue4 = 0; // storage for 12 bit analog value
 
 // Task Intervals (in milliseconds)
 unsigned long task1Interval = 100;	// 100ms (10hz) interval for keep alive frame
@@ -206,9 +230,9 @@ void setup()
 
 	// If using the old shifting logic for compatibility with the hardware switch:
 	if (analogValue < 512)
-	{	// Adjust the threshold as necessary
-		// This block is left empty since the new protocol uses absolute IDs,
-		// but I am keeping the structure for future protocol versioning if needed.
+	{ // Adjust the threshold as necessary
+	  // This block is left empty since the new protocol uses absolute IDs,
+	  // but I am keeping the structure for future protocol versioning if needed.
 	}
 
 	pinMode(LED_PIN, OUTPUT);
@@ -391,22 +415,27 @@ void canRead()
 		else if (mux_id == MUX_ID_SPI)
 		{ // Mux ID 3: SPI Configuration
 			// Logic to store SPI configuration (Pin Mode, Edge Select, Thresholds, etc.) goes here.
-			if (mux_index == 0)
-			{ // SPI1
+			if (mux_index < 4)
+			{
+				// Incorrect??
 				// Read Pin Mode (Bits 7-6 of Byte 1)
-				SPI_MODE_DPI1 = (rxBuf[1] >> 6) & 0x03;
+				SpiConfigs[mux_index].pinMode = (rxBuf[1] >> 6) & 0x03;
+
+				// Read the Edge Select (Rising/Falling) and Pullup Mode
+				// Raw bits show as
+				// Rising & PU Disabled: [0], Rising & PU Enabled [10]
+				// Falling & PU Disabled: [1], Falling & PU Enabled [11]
+				SpiConfigs[mux_index].edgeSelect = (rxBuf[1] & (1 << 0)) != 0;
+				SpiConfigs[mux_index].pullUp = (rxBuf[1] & (1 << 1)) != 0;
 			}
 		}
 		else if (mux_id == MUX_ID_AVI)
 		{ // Mux ID 4: AVI Configuration
 			// Logic to store AVI configuration (Switch On/Off Thresholds) goes here.
-			if (mux_index == 0)
-			{
-				// Thresholds are 16-bit (mV, 5000 = 5.00V)
-				// Note: The hardware may scale 10V to 5V, but the protocol expects 5V thresholds.
-				AVI1_ON_TH = getUint16_MSBLSB(rxBuf, 2);  // 2:7 - 3:0
-				AVI1_OFF_TH = getUint16_MSBLSB(rxBuf, 4); // 4:7 - 5:0
-			}
+			// Thresholds are 16-bit (mV, 5000 = 5.00V)
+			// Note: The hardware may scale 10V to 5V, but the protocol expects 5V thresholds.
+			AviConfigs[mux_index].ON_TH = getUint16_MSBLSB(rxBuf, 2);  // 2:7 - 3:0
+			AviConfigs[mux_index].OFF_TH = getUint16_MSBLSB(rxBuf, 4); // 4:7 - 5:0
 		}
 		break;
 
@@ -573,30 +602,36 @@ void SendDPIValues_NewProtocol()
 		unsigned int duty = 0;
 		unsigned int freq = 0;
 
+		// Edge Select is 0 for Rising, 1 for Falling and is just used to invert the reported pin state
+		bool edgeSelect = SpiConfigs[mux_index].edgeSelect;
+		bool pullUp = SpiConfigs[mux_index].pullUp;
+
 		// Get values based on index
 		if (mux_index == 0)
-		{									 // DPI1/SPI1
-			state = !digitalRead(DPI1input); // Current state for SPI1
-			// AVI input reading (5V scale)
-			voltage = map(analogRead(A0), 0, 1023, 0, 5000);
+		{													 // DPI1/SPI1
+			state = (!digitalRead(DPI1input) != edgeSelect); // Current state for SPI1
+			SpiConfigs[mux_index].lastState = DPI1in;
 			duty = dutyCycle * 10;	// Duty Cycle * 10 (0-1000)
 			freq = frequency * 100; // Frequency * 100 (Hz, 1000 = 1000Hz)
 		}
 		else if (mux_index == 1)
 		{ // DPI2/SPI2
-			state = DPI2in;
-			voltage = map(analogRead(A1), 0, 1023, 0, 5000);
+			state = (DPI2in != edgeSelect);
+			SpiConfigs[mux_index].lastState = DPI2in;
 		}
 		else if (mux_index == 2)
 		{ // DPI3/SPI3
-			state = DPI3in;
-			voltage = map(analogRead(A2), 0, 1023, 0, 5000);
+			state = (DPI3in != edgeSelect);
+			SpiConfigs[mux_index].lastState = DPI3in;
 		}
 		else if (mux_index == 3)
 		{ // DPI4/SPI4
-			state = DPI4in;
-			voltage = map(analogRead(A3), 0, 1023, 0, 5000);
+			state = (DPI4in != edgeSelect);
+			SpiConfigs[mux_index].lastState = DPI4in;
 		}
+
+		// Fake the voltage based off state so it behaves logically
+		voltage = map((state), 0, 1, 0, 5000);
 
 		// Byte 0: Mux ID (3=SPI) [7-5] and Mux Index [3-0]
 		DPIdata[0] = (MUX_ID_SPI << 5) | (mux_index & 0x0F);
@@ -636,11 +671,38 @@ void SendAnalogAndSPIStatus()
 	avi_v[2] = map(analogRead(A2), 0, 1023, 0, 5000);
 	avi_v[3] = map(analogRead(A3), 0, 1023, 0, 5000);
 
-	// Determine State: For this simple implementation, we'll assume state is ON (1) if voltage > 100mV
+	// Determine State from defined mv threshold values
 	bool avi_state[4];
-	for (int i = 0; i < 4; i++)
+	for (int i = 0; i < sizeof(avi_state); i++)
 	{
-		avi_state[i] = (avi_v[i] > 100);
+		// avi_state[i] = (avi_v[i] > 100);
+		avi_state[i] = false;
+
+		// Determine state only if threshold value is set
+		// Low ON mv threshold and high OFF  mv threshold
+		if (AviConfigs[i].ON_TH < AviConfigs[i].OFF_TH)
+		{
+			if (AviConfigs[i].ON_TH != 65535 && avi_v[i] <= AviConfigs[i].ON_TH)
+			{
+				avi_state[i] = true;
+			}
+			else if (AviConfigs[i].OFF_TH != 65535 && avi_v[i] >= AviConfigs[i].OFF_TH)
+			{
+				avi_state[i] = false;
+			}
+		}
+		// High ON mv threshold and low mv OFF threshold
+		if (AviConfigs[i].ON_TH > AviConfigs[i].OFF_TH)
+		{
+			if (AviConfigs[i].ON_TH != 65535 && avi_v[i] >= AviConfigs[i].ON_TH)
+			{
+				avi_state[i] = true;
+			}
+			else if (AviConfigs[i].OFF_TH != 65535 && avi_v[i] <= AviConfigs[i].OFF_TH)
+			{
+				avi_state[i] = false;
+			}
+		}
 	}
 
 	byte AVIdata1[8] = {0};
@@ -686,30 +748,37 @@ void SendAnalogAndSPIStatus()
 
 	// SPI 1-4 Voltage uses the same scaled value as AVI 1-4 (0-5000mV scale)
 	bool spi_state[4];
-	spi_state[0] = !digitalRead(DPI1input);
-	spi_state[1] = !digitalRead(DPI2input);
-	spi_state[2] = !digitalRead(DPI3input);
-	spi_state[3] = !digitalRead(DPI4input);
+	spi_state[0] = (!digitalRead(DPI1input) != SpiConfigs[0].edgeSelect);
+	spi_state[1] = (!digitalRead(DPI2input) != SpiConfigs[1].edgeSelect);
+	spi_state[2] = (!digitalRead(DPI3input) != SpiConfigs[2].edgeSelect);
+	spi_state[3] = (!digitalRead(DPI4input) != SpiConfigs[3].edgeSelect);
+
+	// Fake SPI voltage based off state
+	unsigned int spi_v[4];
+	spi_v[0] = map(spi_state[0], 0, 1, 0, 5000);
+	spi_v[1] = map(spi_state[1], 0, 1, 0, 5000);
+	spi_v[2] = map(spi_state[2], 0, 1, 0, 5000);
+	spi_v[3] = map(spi_state[3], 0, 1, 0, 5000);
 
 	// --- SPI 1 PACKING (15-bit Voltage: 0:6 - 1:0) ---
 	SPIdata1[0] |= (spi_state[0] << 7);
-	SPIdata1[0] |= (avi_v[0] >> 8) & 0x7F;
-	SPIdata1[1] |= avi_v[0] & 0xFF;
+	SPIdata1[0] |= (spi_v[0] >> 8) & 0x7F;
+	SPIdata1[1] |= spi_v[0] & 0xFF;
 
 	// --- SPI 2 PACKING (15-bit Voltage: 2:6 - 3:0) ---
 	SPIdata1[2] |= (spi_state[1] << 7);
-	SPIdata1[2] |= (avi_v[1] >> 8) & 0x7F;
-	SPIdata1[3] |= avi_v[1] & 0xFF;
+	SPIdata1[2] |= (spi_v[1] >> 8) & 0x7F;
+	SPIdata1[3] |= spi_v[1] & 0xFF;
 
 	// --- SPI 3 PACKING (15-bit Voltage: 4:6 - 5:0) ---
 	SPIdata1[4] |= (spi_state[2] << 7);
-	SPIdata1[4] |= (avi_v[2] >> 8) & 0x7F;
-	SPIdata1[5] |= avi_v[2] & 0xFF;
+	SPIdata1[4] |= (spi_v[2] >> 8) & 0x7F;
+	SPIdata1[5] |= spi_v[2] & 0xFF;
 
 	// --- SPI 4 PACKING (15-bit Voltage: 6:6 - 7:0) ---
 	SPIdata1[6] |= (spi_state[3] << 7);
-	SPIdata1[6] |= (avi_v[3] >> 8) & 0x7F;
-	SPIdata1[7] |= avi_v[3] & 0xFF;
+	SPIdata1[6] |= (spi_v[3] >> 8) & 0x7F;
+	SPIdata1[7] |= spi_v[3] & 0xFF;
 
 	CAN0.sendMsgBuf(SPI_STATUS_ID_1, 0, 8, SPIdata1);
 
@@ -812,9 +881,53 @@ void debugPrint()
 	Serial.println(safeStateDPO1);
 	Serial.print("HBO1 Active State: ");
 	Serial.println(activeStateDPO1);
-	Serial.print("AVI1 Voltage (mV, 5V Scale): ");
-	// FIX: debugPrint uses 5V scaling
-	Serial.println(map(analogRead(A0), 0, 1023, 0, 5000));
+	Serial.println("--------");
+	// //AVi1
+	// // FIX: debugPrint uses 5V scaling?
+	Serial.println("AVI Voltages (mV, 5V Scale): ");
+	Serial.print("AVI1: ");
+	Serial.print(map(analogRead(A0), 0, 1023, 0, 5000));
+	Serial.print(" || ON OFF Threshold: ");
+	Serial.print(AviConfigs[0].ON_TH);
+	Serial.print(" / ");
+	Serial.println(AviConfigs[0].OFF_TH);
+	// AVI2
+	Serial.print("AVI2: ");
+	Serial.print(map(analogRead(A1), 0, 1023, 0, 5000));
+	Serial.print(" || ON / OFF Threshold: ");
+	Serial.print(AviConfigs[1].ON_TH);
+	Serial.print(" / ");
+	Serial.println(AviConfigs[1].OFF_TH);
+	// AVI3
+	Serial.print("AVI3: ");
+	Serial.print(map(analogRead(A2), 0, 1023, 0, 5000));
+	Serial.print(" || ON OFF Threshold: ");
+	Serial.print(AviConfigs[2].ON_TH);
+	Serial.print(" / ");
+	Serial.println(AviConfigs[2].OFF_TH);
+	// AVI4
+	Serial.print("AVI4: ");
+	Serial.print(map(analogRead(A3), 0, 1023, 0, 5000));
+	Serial.print(" || ON OFF Threshold: ");
+	Serial.print(AviConfigs[3].ON_TH);
+	Serial.print(" / ");
+	Serial.println(AviConfigs[3].OFF_TH);
+	Serial.println("--------");
+
+	// Print each SPI config on a single line
+	for (int i = 0; i < 4; i++)
+	{
+		Serial.print("SPI");
+		Serial.print(i + 1);
+		Serial.print(", EdgeSelect: ");
+		Serial.print(SpiConfigs[i].edgeSelect ? "Rising" : "Falling");
+		Serial.print(", PullUp: ");
+		Serial.print(SpiConfigs[i].pullUp ? "Enaled" : "Disabled");
+		Serial.print(", LastState: ");
+		Serial.println(SpiConfigs[i].lastState ? "On" : "Off");
+	}
+	Serial.println("--------");
+
 	noInterrupts();
 	Serial.print("DPI1 Freq (Hz): ");
 	Serial.println((highTime + lowTime > 0) ? (1000000UL / (highTime + lowTime)) : 0);
